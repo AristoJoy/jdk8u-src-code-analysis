@@ -3088,6 +3088,12 @@ static void thread_entry(JavaThread* thread, TRAPS) {
   HandleMark hm(THREAD);
   Handle obj(THREAD, thread->threadObj());
   JavaValue result(T_VOID);
+  // 通过JavaCalls调用Java线程对象的run方法
+  // obj：Java线程对象；
+  // KlassHandle(THREAD, SystemDictionary::Thread_klass())：
+  //	Java线程类，记录在SystemDictionary中，即java_lang_Thread；
+  // vmSymbols::run_method_name()：即"run"；
+  // vmSymbols::void_method_signature()：即"()V"；
   JavaCalls::call_virtual(&result,
                           obj,
                           KlassHandle(THREAD, SystemDictionary::Thread_klass()),
@@ -3119,6 +3125,7 @@ JVM_ENTRY(void, JVM_StartThread(JNIEnv* env, jobject jthread))
     // there is a small window between the Thread object being created
     // (with its JavaThread set) and the update to its threadStatus, so we
     // have to check for this
+  // 判断Java线程是否已经启动，如果已经启动过，则会抛异常
     if (java_lang_Thread::thread(JNIHandles::resolve_non_null(jthread)) != NULL) {
       throw_illegal_thread_state = true;
     } else {
@@ -3132,6 +3139,7 @@ JVM_ENTRY(void, JVM_StartThread(JNIEnv* env, jobject jthread))
       // size_t (an unsigned type), so avoid passing negative values which would
       // result in really large stacks.
       size_t sz = size > 0 ? (size_t) size : 0;
+      // 创建Java线程
       native_thread = new JavaThread(&thread_entry, sz);
 
       // At this point it may be possible that no osthread was created for the
@@ -3142,6 +3150,7 @@ JVM_ENTRY(void, JVM_StartThread(JNIEnv* env, jobject jthread))
       // JavaThread constructor.
       if (native_thread->osthread() != NULL) {
         // Note: the current thread is not being used within "prepare".
+        // 将Java 中的Thread和JVM中的Thread进行绑定
         native_thread->prepare(jthread);
       }
     }
@@ -3173,7 +3182,7 @@ JVM_ENTRY(void, JVM_StartThread(JNIEnv* env, jobject jthread))
     tl->set_cached_stack_trace_id(JfrStackTraceRepository::record(thread, 2));
   }
 #endif
-
+// 开始执行所创建的内核线程, 执行thread_entry()方法
   Thread::start(native_thread);
 
 JVM_END
@@ -3294,6 +3303,8 @@ JVM_END
 
 JVM_ENTRY(void, JVM_Yield(JNIEnv *env, jclass threadClass))
   JVMWrapper("JVM_Yield");
+  //  检查是否设置了DontYieldALot参数,默认为fasle
+  //  如果设置为true,直接返回
   if (os::dont_yield()) return;
 #ifndef USDT2
   HS_DTRACE_PROBE0(hotspot, thread__yield);
@@ -3302,6 +3313,7 @@ JVM_ENTRY(void, JVM_Yield(JNIEnv *env, jclass threadClass))
 #endif /* USDT2 */
   // When ConvertYieldToSleep is off (default), this matches the classic VM use of yield.
   // Critical for similar threading behaviour
+// 如果ConvertYieldToSleep=true（默认为false）,调用os::sleep,否则调用os::yield
   if (ConvertYieldToSleep) {
     os::sleep(thread, MinSleepInterval, false);
   } else {
@@ -3323,12 +3335,14 @@ JVM_ENTRY(void, JVM_Sleep(JNIEnv* env, jclass threadClass, jlong millis))
     THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), "timeout value is negative");
   }
 
+// 如果线程中断标志为true，sleep可以被中断，抛出中断异常，同时会清除中断标志位  第二个参数为true是清除中断标志位
   if (Thread::is_interrupted (THREAD, true) && !HAS_PENDING_EXCEPTION) {
     THROW_MSG(vmSymbols::java_lang_InterruptedException(), "sleep interrupted");
   }
 
   // Save current thread state and restore it at the end of this block.
   // And set new thread state to SLEEPING.
+// 设置线程状态为SLEEPING
   JavaThreadSleepState jtss(thread);
 
 #ifndef USDT2
@@ -3345,17 +3359,23 @@ JVM_ENTRY(void, JVM_Sleep(JNIEnv* env, jclass threadClass, jlong millis))
     // JVM_Sleep. Critical for similar threading behaviour (Win32)
     // It appears that in certain GUI contexts, it may be beneficial to do a short sleep
     // for SOLARIS
+    // 如果设置了ConvertSleepToYield(默认为true),和yield效果相同
     if (ConvertSleepToYield) {
       os::yield();
     } else {
+      // 否则调用os::sleep方法
       ThreadState old_state = thread->osthread()->get_state();
       thread->osthread()->set_state(SLEEPING);
+      // sleep会休眠1ms    传入的interruptible为false
       os::sleep(thread, MinSleepInterval, false);
       thread->osthread()->set_state(old_state);
     }
   } else {
+    // 参数大于0
+    // 保存初始状态，返回时恢复原状态
     ThreadState old_state = thread->osthread()->get_state();
     thread->osthread()->set_state(SLEEPING);
+    // 调用os::sleep方法，如果线程中断标志为true，抛出异常   millis>0,传入的interruptible为true 表示为可中断的
     if (os::sleep(thread, millis, true) == OS_INTRPT) {
       // An asynchronous exception (e.g., ThreadDeathException) could have been thrown on
       // us while we were sleeping. We do not overwrite those.

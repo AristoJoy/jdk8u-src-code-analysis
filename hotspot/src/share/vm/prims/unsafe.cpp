@@ -1212,8 +1212,12 @@ UNSAFE_END
 
 UNSAFE_ENTRY(jboolean, Unsafe_CompareAndSwapInt(JNIEnv *env, jobject unsafe, jobject obj, jlong offset, jint e, jint x))
   UnsafeWrapper("Unsafe_CompareAndSwapInt");
+// 根据偏移量，计算value的地址
   oop p = JNIHandles::resolve(obj);
   jint* addr = (jint *) index_oop_from_field_offset_long(p, offset);
+// Atomic::cmpxchg(x, addr, e) cas逻辑 x:要交换的值   e:要比较的值
+// cas成功，返回期望值e，等于e,此方法返回true
+// cas失败，返回内存中的value值，不等于e，此方法返回false
   return (jint)(Atomic::cmpxchg(x, addr, e)) == e;
 UNSAFE_END
 
@@ -1296,7 +1300,7 @@ UNSAFE_ENTRY(void, Unsafe_Unpark(JNIEnv *env, jobject unsafe, jobject jthread))
         if (java_thread != NULL) {
           JavaThread* thr = java_lang_Thread::thread(java_thread);
           if (thr != NULL) {
-            p = thr->parker();
+            p = thr->parker(); // 将JavaThread的成员变量_parker赋值给p
             if (p != NULL) { // Bind to Java thread for next time.
               java_lang_Thread::set_park_event(java_thread, addr_to_java(p));
             }
@@ -1312,7 +1316,7 @@ UNSAFE_ENTRY(void, Unsafe_Unpark(JNIEnv *env, jobject unsafe, jobject jthread))
     HOTSPOT_THREAD_UNPARK(
                           (uintptr_t) p);
 #endif /* USDT2 */
-    p->unpark();
+    p->unpark();  // 核心逻辑，调用了Parker的unpark方法
   }
 UNSAFE_END
 

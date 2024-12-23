@@ -35,6 +35,7 @@
 // knows about ObjectWaiters, so we'll have to reconcile that code.
 // See next_waiter(), first_waiter(), etc.
 
+// 双向链表结构的代理线程，对等待锁的线程的封装
 class ObjectWaiter : public StackObj {
  public:
   enum TStates { TS_UNDEF, TS_READY, TS_RUN, TS_WAIT, TS_ENTER, TS_CXQ } ;
@@ -135,19 +136,19 @@ class ObjectMonitor {
   // initialize the monitor, exception the semaphore, all other fields
   // are simple integers or pointers
   ObjectMonitor() {
-    _header       = NULL;
+    _header       = NULL;    // 对象头  markOop
     _count        = 0;
     _waiters      = 0,
-    _recursions   = 0;
-    _object       = NULL;
-    _owner        = NULL;
-    _WaitSet      = NULL;
+    _recursions   = 0;      // 锁的重入次数
+    _object       = NULL;    // 存储锁对象
+    _owner        = NULL;    // 标识拥有该monitor的线程（获取锁的线程）
+    _WaitSet      = NULL;    // 等待线程（调用wait）组成的双向循环链表，_WaitSet是第一个节点
     _WaitSetLock  = 0 ;
     _Responsible  = NULL ;
     _succ         = NULL ;
-    _cxq          = NULL ;
+    _cxq          = NULL ;  // 多线程竞争锁会先存到这个单向链表中
     FreeNext      = NULL ;
-    _EntryList    = NULL ;
+    _EntryList    = NULL ;  // 存放在进入或重新进入时被阻塞(blocked)的线程 (也是存竞争失败的锁)
     _SpinFreq     = 0 ;
     _SpinClock    = 0 ;
     OwnerIsThread = 0 ;

@@ -1861,6 +1861,7 @@ JRT_END
 
 
 // Handles the uncommon case in locking, i.e., contention or an inflated lock.
+// 处理不常见的锁定情况，即竞争或膨胀的锁。
 #ifndef PRODUCT
 int SharedRuntime::_monitor_enter_ctr=0;
 #endif
@@ -1873,10 +1874,12 @@ JRT_ENTRY_NO_ASYNC(void, SharedRuntime::complete_monitor_locking_C(oopDesc* _obj
     Atomic::inc(BiasedLocking::slow_path_entry_count_addr());
   }
   Handle h_obj(THREAD, obj);
+// 在 JVM 启动时，判断是否开启偏向锁
   if (UseBiasedLocking) {
     // Retry fast entry if bias is revoked to avoid unnecessary inflation
     ObjectSynchronizer::fast_enter(h_obj, lock, true, CHECK);
   } else {
+    // 进入轻量级锁获取逻辑
     ObjectSynchronizer::slow_enter(h_obj, lock, CHECK);
   }
   assert(!HAS_PENDING_EXCEPTION, "Should have no exception here");

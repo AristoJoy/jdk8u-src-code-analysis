@@ -832,12 +832,14 @@ static void *java_start(Thread *thread) {
     sync->notify_all();
 
     // wait until os::start_thread()
+    // 不停的查看线程的当前状态是不是Initialized, 如果是的话，调用了sync->wait()的方法等待
     while (osthread->get_state() == INITIALIZED) {
       sync->wait(Mutex::_no_safepoint_check_flag);
     }
   }
 
   // call one more level start routine
+  // 被唤醒后执行run方法
   thread->run();
 
   return 0;
@@ -912,6 +914,8 @@ bool os::create_thread(Thread* thread, ThreadType thr_type, size_t stack_size) {
     }
 
     pthread_t tid;
+    // 创建线程
+    // java_start新起的线程运行的初始地址
     int ret = pthread_create(&tid, &attr, (void* (*)(void*)) java_start, thread);
 
     pthread_attr_destroy(&attr);
@@ -1029,6 +1033,7 @@ void os::pd_start_thread(Thread* thread) {
   assert(osthread->get_state() != INITIALIZED, "just checking");
   Monitor* sync_with_child = osthread->startThread_lock();
   MutexLockerEx ml(sync_with_child, Mutex::_no_safepoint_check_flag);
+  // 唤醒线程
   sync_with_child->notify();
 }
 
@@ -4088,12 +4093,14 @@ int os::sleep(Thread* thread, jlong millis, bool interruptible) {
 
   ParkEvent * const slp = thread->_SleepEvent ;
   slp->reset() ;
+  //调用写屏障
   OrderAccess::fence() ;
 
   if (interruptible) {
     jlong prevtime = javaTimeNanos();
 
     for (;;) {
+      // 判断线程中断标志为true, 并清除中断标志位，直接返回
       if (os::is_interrupted(thread, true)) {
         return OS_INTRPT;
       }
@@ -4103,6 +4110,7 @@ int os::sleep(Thread* thread, jlong millis, bool interruptible) {
       if (newtime - prevtime < 0) {
         // time moving backwards, should only happen if no monotonic clock
         // not a guarantee() because JVM should not abort on kernel/glibc bugs
+        // 如果linux不支持monotonic lock,有可能出现newtime<prevtime
         assert(!Linux::supports_monotonic_clock(), "time moving backwards");
       } else {
         millis -= (newtime - prevtime) / NANOSECS_PER_MILLISEC;
@@ -4123,7 +4131,7 @@ int os::sleep(Thread* thread, jlong millis, bool interruptible) {
         jt->set_suspend_equivalent();
         // cleared by handle_special_suspend_equivalent_condition() or
         // java_suspend_self() via check_and_wait_while_suspended()
-
+        // 底层调用pthread_cond_timedwait实现  既可以阻塞在某个条件变量上，也可以设置超时时间
         slp->park(millis);
 
         // were we externally suspended while we were waiting?
@@ -4131,6 +4139,8 @@ int os::sleep(Thread* thread, jlong millis, bool interruptible) {
       }
     }
   } else {
+    // 如果interruptible=false
+    // 设置osthread的状态为cond_wait
     OSThreadWaitState osts(thread->osthread(), false /* not Object.wait() */);
     jlong prevtime = javaTimeNanos();
 
@@ -4150,6 +4160,7 @@ int os::sleep(Thread* thread, jlong millis, bool interruptible) {
       if(millis <= 0) break ;
 
       prevtime = newtime;
+      // 底层调用pthread_cond_timedwait实现
       slp->park(millis);
     }
     return OS_OK ;
@@ -4198,6 +4209,9 @@ bool os::dont_yield() {
 }
 
 void os::yield() {
+  // sched_yield是linux kernel提供的API,它会使调用线程放弃CPU使用权，加入到同等优先级队列的末尾；
+  // 如果调用线程是优先级最高的唯一线程，yield方法返回后，调用线程会继续运行；
+  // 因此可以知道，对于和调用线程相同或更高优先级的线程来说，yield方法会给予了它们一次运行的机会；
   sched_yield();
 }
 
@@ -6244,6 +6258,7 @@ void Parker::park(bool isAbsolute, jlong time) {
   // Return immediately if a permit is available.
   // We depend on Atomic::xchg() having full barrier semantics
   // since we are doing a lock-free update to _counter.
+  // 使用 xchg 指令修改为0,返回原值，原值大于0说明有通行证，直接返回
   if (Atomic::xchg(0, &_counter) > 0) return;
 
   Thread* thread = Thread::current();
@@ -6252,6 +6267,7 @@ void Parker::park(bool isAbsolute, jlong time) {
 
   // Optional optimization -- avoid state transitions if there's an interrupt pending.
   // Check interrupt before trying to wait
+  // 如果当前线程的中断标志位为true，直接返回，注意：不会清除中断标志位
   if (Thread::is_interrupted(thread, false)) {
     return;
   }
@@ -6272,21 +6288,25 @@ void Parker::park(bool isAbsolute, jlong time) {
   // In particular a thread must never block on the Threads_lock while
   // holding the Parker:: mutex.  If safepoints are pending both the
   // the ThreadBlockInVM() CTOR and DTOR may grab Threads_lock.
+  // 构造当前线程的 ThreadBlockInVM, 为了防止死锁等特殊场景
   ThreadBlockInVM tbivm(jt);
 
   // Don't wait if cannot get lock since interference arises from
   // unblocking.  Also. check interrupt before trying wait
+  // 再次判断线程是否存在中断状态，如果存在，尝试获取互斥锁，如果获取失败，直接返回
   if (Thread::is_interrupted(thread, false) || pthread_mutex_trylock(_mutex) != 0) {
     return;
   }
 
   int status ;
+  // 如果_counter > 0, 不需要等待
   if (_counter > 0)  { // no wait needed
-    _counter = 0;
-    status = pthread_mutex_unlock(_mutex);
+    _counter = 0; // _counter重置为0
+    status = pthread_mutex_unlock(_mutex); // 释放互斥锁
     assert (status == 0, "invariant") ;
     // Paranoia to ensure our locked and lock-free paths interact
     // correctly with each other and Java-level accesses.
+    // 插入写屏障
     OrderAccess::fence();
     return;
   }
@@ -6306,9 +6326,12 @@ void Parker::park(bool isAbsolute, jlong time) {
   assert(_cur_index == -1, "invariant");
   if (time == 0) {
     _cur_index = REL_INDEX; // arbitrary choice when not timed
+    // pthread_cond_wait用于阻塞当前线程，等待别的线程使用 pthread_cond_signal或pthread_cond_broadcast来唤醒它
+    // pthread_cond_wait内部实现：先释放mutex，然后加入waiter队列等待signal，如果有signal唤醒了该线程则后续执行重新上锁
     status = pthread_cond_wait (&_cond[_cur_index], _mutex) ;
   } else {
     _cur_index = isAbsolute ? ABS_INDEX : REL_INDEX;
+    // 线程进入有超时时间的等待，内部实现调用了pthread_cond_timedwait
     status = os::Linux::safe_cond_timedwait (&_cond[_cur_index], _mutex, &absTime) ;
     if (status != 0 && WorkAroundNPTLTimedWaitHang) {
       pthread_cond_destroy (&_cond[_cur_index]) ;
@@ -6323,12 +6346,14 @@ void Parker::park(bool isAbsolute, jlong time) {
 #ifdef ASSERT
   pthread_sigmask(SIG_SETMASK, &oldsigs, NULL);
 #endif
-
+  // _counter重新设置为0
   _counter = 0 ;
+  // 释放互斥锁
   status = pthread_mutex_unlock(_mutex) ;
   assert_status(status == 0, status, "invariant") ;
   // Paranoia to ensure our locked and lock-free paths interact
   // correctly with each other and Java-level accesses.
+  // 插入写屏障
   OrderAccess::fence();
 
   // If externally suspended while waiting, re-suspend
@@ -6339,32 +6364,43 @@ void Parker::park(bool isAbsolute, jlong time) {
 
 void Parker::unpark() {
   int s, status ;
+  // 获取互斥锁
   status = pthread_mutex_lock(_mutex);
   assert (status == 0, "invariant") ;
   s = _counter;
+  // 将_counter置为1
   _counter = 1;
+  // s记录的是unpark之前的_counter旧值，如果s < 1，说明有可能该线程在等待状态，需要唤醒。
   if (s < 1) {
     // thread might be parked
     if (_cur_index != -1) {
       // thread is definitely parked
+      // 根据虚拟机参数WorkAroundNPTLTimedWaitHang来做不同的处理，默认该参数是1
       if (WorkAroundNPTLTimedWaitHang) {
+        // pthread_cond_signal的作用： 发送一个信号给另外一个正在处于阻塞等待状态的线程,使其脱离阻塞状态,继续执行.
         status = pthread_cond_signal (&_cond[_cur_index]);
         assert (status == 0, "invariant");
+        // 释放互斥锁，先唤醒后释放锁，可能会导致线程被唤醒后获取不到锁，再次进入等待状态，性能会有点影响
         status = pthread_mutex_unlock(_mutex);
         assert (status == 0, "invariant");
       } else {
         // must capture correct index before unlocking
         int index = _cur_index;
+        // 先释放锁
         status = pthread_mutex_unlock(_mutex);
         assert (status == 0, "invariant");
+        // 后发信号唤醒线程，唤醒操作在互斥代码块外部，不会出现前面的性能问题
+        // 但有可能出现低优先级的线程抢占到高优先级线程（cond_wait的线程）的metux，先执行
         status = pthread_cond_signal (&_cond[index]);
         assert (status == 0, "invariant");
       }
     } else {
+      // _cur_index==-1 释放互斥锁
       pthread_mutex_unlock(_mutex);
       assert (status == 0, "invariant") ;
     }
   } else {
+    // s==1 释放互斥锁
     pthread_mutex_unlock(_mutex);
     assert (status == 0, "invariant") ;
   }

@@ -166,31 +166,63 @@ static volatile int MonitorPopulation = 0 ;      // # Extant -- in circulation
 // if the following function is changed. The implementation is
 // extremely sensitive to race condition. Be careful.
 
+/*
+偏向锁的获取由BiasedLocking::revoke_and_rebias方法实现
+1、通过markOop mark = obj->mark()获取对象的markOop数据mark，即对象头的Mark Word；
+2、判断mark是否为可偏向状态，即mark的偏向锁标志位为 1，锁标志位为 01；
+3、判断mark中JavaThread的状态：如果为空，则进入步骤（4）；
+如果指向当前线程，则执行同步代码块；如果指向其它线程，进入步骤（5）；
+4、通过CAS原子指令设置mark中JavaThread为当前线程ID，如果执行CAS成功，
+则执行同步代码块，否则进入步骤（5）；
+5、如果执行CAS失败，表示当前存在多个线程竞争锁，当达到全局安全点（safepoint），
+获得偏向锁的线程被挂起，撤销偏向锁，并升级为轻量级，
+升级完成后被阻塞在安全点的线程继续执行同步代码块；
+
+偏向锁的撤销由BiasedLocking::revoke_at_safepoint方法实现
+1、偏向锁的撤销动作必须等待全局安全点；
+2、暂停拥有偏向锁的线程，判断锁对象是否处于被锁定状态；
+3、撤销偏向锁，恢复到无锁（标志位为 01）或轻量级锁（标志位为 00）的状态
+
+jdk1.6之后默认开启偏向锁
+开启偏向锁：-XX:+UseBiasedLocking -XX:BiasedLockingStartupDelay=0(默认有延迟，关闭延迟)
+关闭偏向锁 XX:-UseBiasedLocking
+*/
 void ObjectSynchronizer::fast_enter(Handle obj, BasicLock* lock, bool attempt_rebias, TRAPS) {
+  // 判断是否开启偏向锁
  if (UseBiasedLocking) {
+   // 判断是否不在全局安全点
     if (!SafepointSynchronize::is_at_safepoint()) {
+      // 撤销和重偏向
       BiasedLocking::Condition cond = BiasedLocking::revoke_and_rebias(obj, attempt_rebias, THREAD);
+      //ZKTODO: 如果是撤销了偏向锁且重偏向了，那就获取到锁了，不用走slow_enter再去获取锁
+      // 如果是撤销和重偏向状态直接返回
       if (cond == BiasedLocking::BIAS_REVOKED_AND_REBIASED) {
         return;
       }
     } else {
       assert(!attempt_rebias, "can not rebias toward VM thread");
+      // 偏向锁的撤销   只有当其它线程尝试竞争偏向锁时，持有偏向锁的线程才会释放锁
       BiasedLocking::revoke_at_safepoint(obj);
     }
     assert(!obj->mark()->has_bias_pattern(), "biases should be revoked by now");
  }
 
+   // 获取轻量级锁  当关闭偏向锁功能，或多个线程竞争偏向锁导致偏向锁升级为轻量级锁
  slow_enter (obj, lock, THREAD) ;
 }
 
+// 轻量级锁的释放
 void ObjectSynchronizer::fast_exit(oop object, BasicLock* lock, TRAPS) {
   assert(!object->mark()->has_bias_pattern(), "should not see bias pattern here");
   // if displaced header is null, the previous enter is recursive enter, no-op
+  // ZKTODO 获取Lock Record的Displaced Mark Word
+  // 取出栈帧中保存的mark word
   markOop dhw = lock->displaced_header();
   markOop mark ;
-  if (dhw == NULL) {
+  if (dhw == NULL) {  // 如果是null，说明是重入的
      // Recursive stack-lock.
      // Diagnostics -- Could be: stack-locked, inflating, inflated.
+    // 重入锁，什么也不做
      mark = object->mark() ;
      assert (!mark->is_neutral(), "invariant") ;
      if (mark->has_locker() && mark != markOopDesc::INFLATING()) {
@@ -203,19 +235,23 @@ void ObjectSynchronizer::fast_exit(oop object, BasicLock* lock, TRAPS) {
      }
      return ;
   }
-
+  // 获取Mark Word
+  // 获取当前锁对象的mark word
   mark = object->mark() ;
 
   // If the object is stack-locked by the current thread, try to
   // swing the displaced header from the box back to the mark.
+  // ZKTODO 如果是mark word==Displaced Mark Word即轻量级锁，CAS替换对象头的mark word
   if (mark == (markOop) lock) {
      assert (dhw->is_neutral(), "invariant") ;
+    // 通过CAS尝试把dhw替换到当前的Mark Word，如果CAS成功，说明成功的释放了锁
      if ((markOop) Atomic::cmpxchg_ptr (dhw, object->mark_addr(), mark) == mark) {
         TEVENT (fast_exit: release stacklock) ;
         return;
      }
   }
-
+  // ZKTODO 走到这里说明是重量级锁或者解锁时发生了竞争，膨胀后调用重量级锁的exit方法。
+  // CAS失败，此时有竞争，开始膨胀
   ObjectSynchronizer::inflate(THREAD,
                               object,
                               inflate_cause_vm_internal)->exit(true, THREAD);
@@ -227,22 +263,30 @@ void ObjectSynchronizer::fast_exit(oop object, BasicLock* lock, TRAPS) {
 // We don't need to use fast path here, because it must have been
 // failed in the interpreter/compiler code.
 void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
+  // 获取对象的markOop数据 mark
   markOop mark = obj->mark();
   assert(!mark->has_bias_pattern(), "should not see bias pattern here");
-
+  // ZKTODO 如果当前锁对象是无锁状态
+  // 判断mark是否为无锁状态：mark的偏向锁标志位为 0，锁标志位为 01；
   if (mark->is_neutral()) {
     // Anticipate successful CAS -- the ST of the displaced mark must
     // be visible <= the ST performed by the CAS.
+    // 设置Lock Record的Displaced Mark Word并替换对象头的mark word
+    // 把mark保存到BasicLock对象的_displaced_header字段
     lock->set_displaced_header(mark);
+    // 通过CAS尝试将Mark Word更新为指向BasicLock对象的指针，如果更新成功，表示竞争到锁，则执行同步代码
+    // Atomic::cmpxchg_ptr原子操作保证只有一个线程可以把指向栈帧的指针复制到Mark Word
     if (mark == (markOop) Atomic::cmpxchg_ptr(lock, obj()->mark_addr(), mark)) {
       TEVENT (slow_enter: release stacklock) ;
       return ;
     }
+    // CAS失败，进入锁升级
     // Fall through to inflate() ...
-  } else
+  } else  // 如果当前mark处于加锁状态，且mark中的ptr指针指向当前线程的栈帧，表示为重入操作，不需要竞争锁
   if (mark->has_locker() && THREAD->is_lock_owned((address)mark->locker())) {
     assert(lock != mark->locker(), "must not re-lock the same lock");
     assert(lock != (BasicLock*)obj->mark(), "don't relock with same BasicLock");
+    // 如果是重入，则设置Displaced Mark Word为null
     lock->set_displaced_header(NULL);
     return;
   }
@@ -259,7 +303,10 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
   // so it does not matter what the value is, except that it
   // must be non-zero to avoid looking like a re-entrant lock,
   // and must not look locked either.
+  // ZKTODO 走到这一步说明已经是存在多个线程竞争锁了 需要膨胀为重量级锁
+  // 这时候需要膨胀为重量级锁，膨胀前，设置Displaced Mark Word为一个特殊值，代表该锁正在用一个重量级锁的monitor
   lock->set_displaced_header(markOopDesc::unused_mark());
+  // 锁膨胀的过程，该方法返回一个ObjectMonitor对象，然后调用其enter方法
   ObjectSynchronizer::inflate(THREAD,
                               obj(),
                               inflate_cause_monitor_enter)->enter(THREAD);
@@ -269,6 +316,7 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS) {
 // We don't need to use fast path here, because it must have
 // failed in the interpreter/compiler code. Simply use the heavy
 // weight monitor should be ok, unless someone find otherwise.
+// 轻量级锁释放
 void ObjectSynchronizer::slow_exit(oop object, BasicLock* lock, TRAPS) {
   fast_exit (object, lock, THREAD) ;
 }
@@ -388,6 +436,7 @@ ObjectLocker::~ObjectLocker() {
 // NOTE: must use heavy weight monitor to handle wait()
 void ObjectSynchronizer::wait(Handle obj, jlong millis, TRAPS) {
   if (UseBiasedLocking) {
+    // 如果是使用了偏向锁，要撤销偏向锁
     BiasedLocking::revoke_and_rebias(obj, false, THREAD);
     assert(!obj->mark()->has_bias_pattern(), "biases should be revoked by now");
   }
@@ -491,6 +540,10 @@ static SharedGlobals GVars ;
 static int MonitorScavengeThreshold = 1000000 ;
 static volatile int ForceMonitorScavenge = 0 ; // Scavenge required and pending
 
+// 检查是否处于膨胀中状态（其他线程正在膨胀中），
+// 如果是膨胀中，就调用ReadStableMark方法进行等待，
+// ReadStableMark方法执行完毕后再通过continue继续检查，
+// ReadStableMark方法中还会调用os::NakedYield()释放CPU资源
 static markOop ReadStableMark (oop obj) {
   markOop mark = obj->mark() ;
   if (!mark->is_being_inflated()) {
@@ -515,7 +568,9 @@ static markOop ReadStableMark (oop obj) {
     // TODO: restrict the aggregate number of spinners.
 
     ++its ;
+    // 如果its大于10000或者单内核
     if (its > 10000 || !os::is_MP()) {
+      // 每隔一次就yield，放弃cpu控制权
        if (its & 1) {
          os::NakedYield() ;
          TEVENT (Inflate: INFLATING - yield) ;
@@ -535,6 +590,15 @@ static markOop ReadStableMark (oop obj) {
          // then for each thread on the list, set the flag and unpark() the thread.
          // This is conceptually similar to muxAcquire-muxRelease, except that muxRelease
          // wakes at most one thread whereas we need to wake the entire list.
+
+         // 下面的代码降低了活锁的发生但是并不是一个完全的解决方案。一个更加完整的解决方案要求
+         // 正在升级锁的线程持有正在升级的锁。下面的代码简单地限制了自旋的线程的数量最多一个。
+         // 有N-2个线程阻塞在正在膨胀的锁上，一个持有正在升级的锁线程和yield/park策略，一个处于这两种状态的线程。
+         // 更加细致的方法应该更改INFLATINT的编码，这样可以包装一个本地线程的指针。
+         // 等待锁升级完成的线程会使用CAS将他们自己添加到一个头为Mark Word的单循环链表。一旦入队，就执行循环，
+         // 核对每个线程的标志和调用park。当锁升级完成时，完成锁升级的线程会检查到这个list，并且设置Mark Word为升级后的状态，
+         // 然后将每个在list上的线程设置标志并调用unpark唤醒线程。这个类似于mux-Acquire-muxRelease，
+         // 除了muxRelease最多只唤醒一个线程，而我们需要唤醒整个list的线程。
          int ix = (cast_from_oop<intptr_t>(obj) >> 5) & (NINFLATIONLOCKS-1) ;
          int YieldThenBlock = 0 ;
          assert (ix >= 0 && ix < NINFLATIONLOCKS, "invariant") ;
@@ -1245,7 +1309,8 @@ ObjectMonitor* ObjectSynchronizer::inflate_helper(oop obj) {
 // Note that we could encounter some performance loss through false-sharing as
 // multiple locks occupy the same $ line.  Padding might be appropriate.
 
-
+// 锁膨胀过程  膨胀完成返回monitor时，并不表示该线程竞争到了锁，
+// 真正的锁竞争发生在ObjectMonitor::enter方法中
 ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
                                                   oop object,
                                                   const InflateCause cause) {
@@ -1267,8 +1332,18 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
       // *  Neutral      - aggressively inflate the object.
       // *  BIASED       - Illegal.  We should never see this
 
+    //mark是以下状态中的一种：
+    // *  Inflated（重量级锁状态）     - 直接返回
+    // *  Stack-locked（轻量级锁状态） - 膨胀
+    // *  INFLATING（膨胀中）    - 忙等待直到膨胀完成
+    // *  Neutral（无锁状态）      - 膨胀
+    // *  BIASED（偏向锁）       - 非法状态，在这里不会出现
+
       // CASE: inflated
+    // ZKTODO已经是重量级锁，直接返回
+    // 判断当前是否为重量级锁状态，即Mark Word的锁标识位为 10，如果已经是重量级锁状态直接返回
       if (mark->has_monitor()) {
+        // 获取指向ObjectMonitor的指针，并返回，膨胀过程已经完成
           ObjectMonitor * inf = mark->monitor() ;
           assert (inf->header()->is_neutral(), "invariant");
           assert (inf->object() == object, "invariant") ;
@@ -1282,8 +1357,21 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
       // The INFLATING value is transient.
       // Currently, we spin/yield/park and poll the markword, waiting for inflation to finish.
       // We could always eliminate polling by parking the thread on some auxiliary list.
+    // ZKTODO Mark Word全为0，注意轻量级锁的Mark Word中前62位不为null
+    /*
+      如果当前锁处于膨胀中，说明该锁正在被其它线程执行膨胀操作，
+      则当前线程就进行自旋等待锁膨胀完成，这里需要注意一点，虽然是自旋操作，
+      但不会一直占用cpu资源，每隔一段时间会通过os::NakedYield方法放弃cpu资源，
+      或通过park方法挂起；如果其他线程完成锁的膨胀操作，则退出自旋并返回
+    */
       if (mark == markOopDesc::INFLATING()) {
+        // 正在膨胀中，说明另一个线程正在进行锁膨胀，continue重试
          TEVENT (Inflate: spin while INFLATING) ;
+        // 在该方法中会进行spin/yield/park等操作完成自旋动作
+        // 检查是否处于膨胀中状态（其他线程正在膨胀中），
+        // 如果是膨胀中，就调用ReadStableMark方法进行等待，
+        // ReadStableMark方法执行完毕后再通过continue继续检查，
+        // ReadStableMark方法中还会调用os::NakedYield()释放CPU资源
          ReadStableMark(object) ;
          continue ;
       }
@@ -1307,7 +1395,26 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
       // before or after the CAS(INFLATING) operation.
       // See the comments in omAlloc().
 
+    /*
+      如果当前是轻量级锁状态，即锁标识位为 00 ,开始膨胀
+      1、通过omAlloc方法，获取一个可用的ObjectMonitor monitor，并重置monitor数据；
+      2、通过CAS尝试将Mark Word设置为markOopDesc:INFLATING，标识当前锁正在膨胀中，
+      如果CAS失败，说明同一时刻其它线程已经将Mark Word设置为markOopDesc:INFLATING，
+      当前线程进行自旋等待膨胀完成；
+      3、如果CAS成功，设置monitor的各个字段：_header、_owner和_object等，并返回
+    */
+
+    // 在stack-locked情况下
+    //
+    // 我们在将INFLATING状态设置到Mark Word前，预测性地生成一个ObjectMonitor。
+    // 我们之前设置INFLATING、分配ObjectMonitor，最后将ObjectMonitor地址设置到Mark Word中。
+    // 这是正确的，但是这会认为地增加Mark Word中INFLATED存在的时间，因此会增加锁升级的竞争几率。
+    //
+    // 现在使用每个线程独有的ObjectMonitor空闲列表。这些列表是在INFLATING和ST时间间隔外，从全局空闲列表
+    // 中获取的。一个线程可以将多个ObjectMonitor从全局空闲列表中移到线程本地的空闲列表中。
+    // 使用这样的本地空闲列表，就不用关心omAlloc调用出现在CAS前或后面的情况了。
       if (mark->has_locker()) {
+        // 当前轻量级锁状态，先分配一个ObjectMonitor对象，并初始化值
           ObjectMonitor * m = omAlloc (Self) ;
           // Optimistically prepare the objectmonitor - anticipate successful CAS
           // We do this before the CAS in order to minimize the length of time
@@ -1316,11 +1423,14 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
           m->_Responsible  = NULL ;
           m->OwnerIsThread = 0 ;
           m->_recursions   = 0 ;
+        // ObjectMonitor的Spin限制
           m->_SpinDuration = ObjectMonitor::Knob_SpinLimit ;   // Consider: maintain by type/class
-
+        // 使用CAS将INFLATING状态设置到Mark Word中
+        // 设置状态为膨胀中
           markOop cmp = (markOop) Atomic::cmpxchg_ptr (markOopDesc::INFLATING(), object->mark_addr(), mark) ;
-          if (cmp != mark) {
-             omRelease (Self, m, true) ;
+        // 如果CAS操作失败，将释放ObjectMonitor，continue
+          if (cmp != mark) {  // CAS失败，说明冲突了，自旋等待
+             omRelease (Self, m, true) ;  // 释放monitor
              continue ;       // Interference -- just retry
           }
 
@@ -1348,16 +1458,34 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
           // would otherwise permit hashCode values to change or "flicker" for an object.
           // Critically, while object->mark is 0 mark->displaced_mark_helper() is stable.
           // 0 serves as a "BUSY" inflate-in-progress indicator.
-
+        // 成功将INFLATING设置到Mark Word中。这是唯一将Mark Word设置为0的场景。
+        // 只有一个成功将Mark Word设置为INFLATING的线程才会进行锁升级操作。
+        //
+        // 为什么我们使用CAS将Mark Word设置为0而不是直接将Mark Word从Stack Lock值直接设置为升级后的状态？
+        // 考虑到一个线程解锁Stack Lock（轻量级锁）可能发生的情况。线程将线程栈中的Lock Record中Displaced Mark Word
+        // 设置回Object的Mark Word中。
+        // 对象头信息（比如hashcode等）会出现在
+        //		(a) Object的Mark Word中，
+        //		(b) 线程栈中Lock Record中的Displaced Mark Word中，
+        //		(c）ObjectMonitor的Displaced Mark Word中。
+        // inflate函数必须从线程栈的Lock Record将Displaced Mark Word拷贝到ObjectMonitor中，全程保障Hashcode稳定不变。
+        // 如果owner当Mark Word为0时释放锁，释放锁的操作将会失败，控制流程将会从slow_exit转到inflate。
+        // 锁的持有者将会spin，等待0状态消失。换句话说，状态0将会使锁的持有者暂停一会，当锁正在升级过程中，如果owner碰巧尝试释放锁
+        // （将对象头信息从线程栈中恢复到对象头中）。这种方法避免了会导致hashCode值变动的竞争。最重要的是，当Mark Word为0时，
+        //  mark->displaced_mark_helper()函数是稳定的。
+        //
 
           // fetch the displaced mark from the owner's stack.
           // The owner can't die or unwind past the lock while our INFLATING
           // object is in the mark.  Furthermore the owner can't complete
           // an unlock on the object, either.
+        // 栈中的displaced mark word，当在锁升级时，锁持有者不会死亡或者释放之前的锁。
           markOop dmw = mark->displaced_mark_helper() ;
           assert (dmw->is_neutral(), "invariant") ;
 
           // Setup monitor fields to proper values -- prepare the monitor
+        // 设置monitor的字段
+        // CAS成功，设置ObjectMonitor的_header、_owner和_object等
           m->set_header(dmw) ;
 
           // Optimization: if the mark->locker stack address is associated
@@ -1372,6 +1500,8 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
           // Must preserve store ordering. The monitor state must
           // be stable at the time of publishing the monitor address.
           guarantee (object->mark() == markOopDesc::INFLATING(), "invariant") ;
+        // 将锁对象的mark word设置为重量级锁状态
+        // 将锁对象头设置为重量级锁状态
           object->release_set_mark(markOopDesc::encode(m));
 
           // Hopefully the performance counters are allocated on distinct cache lines
@@ -1401,8 +1531,9 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
       // to inflate and then CAS() again to try to swing _owner from NULL to Self.
       // An inflateTry() method that we could call from fast_enter() and slow_enter()
       // would be useful.
-
+    //ZKTODO 无锁状态
       assert (mark->is_neutral(), "invariant");
+    // 分配以及初始化ObjectMonitor对象
       ObjectMonitor * m = omAlloc (Self) ;
       // prepare m for installation - set monitor to initial state
       m->Recycle();
@@ -1413,14 +1544,17 @@ ObjectMonitor * ATTR ObjectSynchronizer::inflate (Thread * Self,
       m->_recursions   = 0 ;
       m->_Responsible  = NULL ;
       m->_SpinDuration = ObjectMonitor::Knob_SpinLimit ;       // consider: keep metastats by type/class
-
+    // ZKTODO 用CAS替换对象头的mark word为重量级锁状态
       if (Atomic::cmpxchg_ptr (markOopDesc::encode(m), object->mark_addr(), mark) != mark) {
+        // 不成功说明有另外一个线程在执行inflate，释放monitor对象
+        // 有竞争CAS失败，释放monitor重试
           m->set_object (NULL) ;
           m->set_owner  (NULL) ;
           m->OwnerIsThread = 0 ;
           m->Recycle() ;
           omRelease (Self, m, true) ;
           m = NULL ;
+        // 继续尝试
           continue ;
           // interference - the markword changed - just retry.
           // The state-transitions are one-way, so there's no chance of

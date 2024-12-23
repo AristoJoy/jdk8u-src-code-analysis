@@ -44,10 +44,10 @@
  * services.
  *
  */
-
+// Parker 类继承 os::PlatformParker。 针对不同操作系统进行适配，比如linux在os_linux.cpp中实现了park，unpark方法
 class Parker : public os::PlatformParker {
 private:
-  volatile int _counter ;
+  volatile int _counter ;  //  通行的许可证，当 _count > 0 时park方法直接返回。unpark会将_counter置为1
   Parker * FreeNext ;
   JavaThread * AssociatedWith ; // Current association
 

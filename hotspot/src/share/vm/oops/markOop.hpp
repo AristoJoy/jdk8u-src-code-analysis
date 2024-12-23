@@ -147,11 +147,11 @@ class markOopDesc: public oopDesc {
   enum { biased_lock_alignment    = 2 << (epoch_shift + epoch_bits)
   };
 
-  enum { locked_value             = 0,
-         unlocked_value           = 1,
-         monitor_value            = 2,
-         marked_value             = 3,
-         biased_lock_pattern      = 5
+  enum { locked_value             = 0,  // 00 轻量级锁
+         unlocked_value           = 1,  // 001 无锁
+         monitor_value            = 2,  // 10 监视器锁，也叫膨胀锁，也叫重量级锁
+         marked_value             = 3,  // 11 GC标记
+         biased_lock_pattern      = 5  // 101 偏向锁
   };
 
   enum { no_hash                  = 0 };  // no hash value assigned

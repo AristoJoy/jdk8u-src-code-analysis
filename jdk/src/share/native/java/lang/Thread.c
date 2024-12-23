@@ -39,7 +39,7 @@
 #define STR "Ljava/lang/String;"
 
 #define ARRAY_LENGTH(a) (sizeof(a)/sizeof(a[0]))
-
+// JNINativeMethod主要是进行一个jni方法的映射关系，将native方法和真正的实现方法进行绑定。
 static JNINativeMethod methods[] = {
     {"start0",           "()V",        (void *)&JVM_StartThread},
     {"stop0",            "(" OBJ ")V", (void *)&JVM_StopThread},
@@ -67,5 +67,6 @@ static JNINativeMethod methods[] = {
 JNIEXPORT void JNICALL
 Java_java_lang_Thread_registerNatives(JNIEnv *env, jclass cls)
 {
+  // java层的Thread在类的静态初始化块中，调用了registerNatives（）方法
     (*env)->RegisterNatives(env, cls, methods, ARRAY_LENGTH(methods));
 }

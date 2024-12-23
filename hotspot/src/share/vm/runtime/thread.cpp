@@ -470,6 +470,7 @@ void Thread::start(Thread* thread) {
       java_lang_Thread::set_thread_status(((JavaThread*)thread)->threadObj(),
                                           java_lang_Thread::RUNNABLE);
     }
+    // 根据不同的操作系统进行线程的启动
     os::start_thread(thread);
   }
 }
@@ -1597,6 +1598,7 @@ JavaThread::JavaThread(ThreadFunction entry_point, size_t stack_sz) :
   os::ThreadType thr_type = os::java_thread;
   thr_type = entry_point == &compiler_thread_entry ? os::compiler_thread :
                                                      os::java_thread;
+  // 创建Java线程对应的内核线程
   os::create_thread(this, thr_type, stack_sz);
   // The _osthread may be NULL here because we ran out of memory (too many threads active).
   // We need to throw and OutOfMemoryError - however we cannot do this here because the caller
@@ -1708,6 +1710,8 @@ void JavaThread::thread_main_inner() {
       this->set_native_thread_name(this->get_thread_name());
     }
     HandleMark hm(this);
+    // entry_point（）返回的其实就是在 new JavaThread(&thread_entry, sz)
+    // 时传入的thread_entry。这里就相当于调用了thread_entry（this，this）
     this->entry_point()(this, this);
   }
 

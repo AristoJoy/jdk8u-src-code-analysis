@@ -1056,7 +1056,7 @@ void MacroAssembler::bang_stack_size(Register size, Register tmp) {
     movptr(Address(tmp, (-i*os::vm_page_size())), size );
   }
 }
-
+// 偏向锁入口
 int MacroAssembler::biased_locking_enter(Register lock_reg,
                                          Register obj_reg,
                                          Register swap_reg,
