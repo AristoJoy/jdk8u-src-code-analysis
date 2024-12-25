@@ -162,6 +162,7 @@ public class CountDownLatch {
         private static final long serialVersionUID = 4982264981922014374L;
 
         Sync(int count) {
+            // 设置state为count
             setState(count);
         }
 
@@ -177,10 +178,12 @@ public class CountDownLatch {
             // Decrement count; signal when transition to zero
             for (;;) {
                 int c = getState();
+                // 如果已释放锁，就不要cas
                 if (c == 0)
                     return false;
                 int nextc = c-1;
                 if (compareAndSetState(c, nextc))
+                    // 只有state为0，返回true
                     return nextc == 0;
             }
         }

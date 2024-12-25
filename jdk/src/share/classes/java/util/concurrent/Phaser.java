@@ -268,10 +268,10 @@ public class Phaser {
     /**
      * Primary state representation, holding four bit-fields:
      *
-     * unarrived  -- the number of parties yet to hit barrier (bits  0-15)
-     * parties    -- the number of parties to wait            (bits 16-31)
-     * phase      -- the generation of the barrier            (bits 32-62)
-     * terminated -- set if barrier is terminated             (bit  63 / sign)
+     * unarrived  -- the number of parties yet to hit barrier (bits  0-15)      // 低16位，未到达数量
+     * parties    -- the number of parties to wait            (bits 16-31)      // 中16位，参与者数量
+     * phase      -- the generation of the barrier            (bits 32-62)      // 高31位，代数
+     * terminated -- set if barrier is terminated             (bit  63 / sign)  // 高1位，终止标志
      *
      * Except that a phaser with no registered parties is
      * distinguished by the otherwise illegal state of having zero
@@ -294,36 +294,62 @@ public class Phaser {
      */
     private volatile long state;
 
+    // 最多可以有多少个参与者，即每个阶段最多有多少个任务
     private static final int  MAX_PARTIES     = 0xffff;
+
+    // 最多可以有多少阶段
     private static final int  MAX_PHASE       = Integer.MAX_VALUE;
+
+    // 参与者数量的偏移量
     private static final int  PARTIES_SHIFT   = 16;
+
+    // 当前阶段的偏移量
     private static final int  PHASE_SHIFT     = 32;
+
+    // 未完成的参与者数的掩码，低16位
     private static final int  UNARRIVED_MASK  = 0xffff;      // to mask ints
+
+    // 参与者数，中间16位
     private static final long PARTIES_MASK    = 0xffff0000L; // to mask longs
+
+    // counts的掩码，counts等于参与者数和未完成的参与者数的'|'操作
     private static final long COUNTS_MASK     = 0xffffffffL;
+
+    // 终止标志的偏移量
     private static final long TERMINATION_BIT = 1L << 63;
 
     // some special values
+    // 一次一个参与者完成
     private static final int  ONE_ARRIVAL     = 1;
+
+    // 增加减少参与者时使用
     private static final int  ONE_PARTY       = 1 << PARTIES_SHIFT;
+
+    // 减少参与者时使用
     private static final int  ONE_DEREGISTER  = ONE_ARRIVAL|ONE_PARTY;
+
+    // 没有参与者时使用
     private static final int  EMPTY           = 1;
 
     // The following unpacking methods are usually manually inlined
 
+    // 用于求未完成参与者数量
     private static int unarrivedOf(long s) {
         int counts = (int)s;
         return (counts == EMPTY) ? 0 : (counts & UNARRIVED_MASK);
     }
 
+    // 用于求参与者数量（中间16位），注意int的位置
     private static int partiesOf(long s) {
         return (int)s >>> PARTIES_SHIFT;
     }
 
+    // 用于求阶段数（高32位），注意int的位置
     private static int phaseOf(long s) {
         return (int)(s >>> PHASE_SHIFT);
     }
 
+    // 已完成参与者的数量
     private static int arrivedOf(long s) {
         int counts = (int)s;
         return (counts == EMPTY) ? 0 :
@@ -346,6 +372,7 @@ public class Phaser {
      * use two of them, alternating across even and odd phases.
      * Subphasers share queues with root to speed up releases.
      */
+    // 用于存储已完成参与者所在的线程，根据当前阶段的奇偶性选择不同的队列
     private final AtomicReference<QNode> evenQ;
     private final AtomicReference<QNode> oddQ;
 
@@ -389,28 +416,37 @@ public class Phaser {
             int unarrived = (counts == EMPTY) ? 0 : (counts & UNARRIVED_MASK);
             if (unarrived <= 0)
                 throw new IllegalStateException(badArrive(s));
+            // 如果修改state成功
             if (UNSAFE.compareAndSwapLong(this, stateOffset, s, s-=adjust)) {
+                // 最后一个到达的
                 if (unarrived == 1) {
                     long n = s & PARTIES_MASK;  // base of next state
                     int nextUnarrived = (int)n >>> PARTIES_SHIFT;
+                    // 如果是root
                     if (root == this) {
+                        // nextUnarraived为0，则设置终止
                         if (onAdvance(phase, nextUnarrived))
                             n |= TERMINATION_BIT;
                         else if (nextUnarrived == 0)
+                            // 如果nextUnarrived为0，设置为empty
                             n |= EMPTY;
                         else
                             n |= nextUnarrived;
                         int nextPhase = (phase + 1) & MAX_PHASE;
                         n |= (long)nextPhase << PHASE_SHIFT;
+                        // 设置下一个state，并且唤醒等待者
                         UNSAFE.compareAndSwapLong(this, stateOffset, s, n);
                         releaseWaiters(phase);
                     }
                     else if (nextUnarrived == 0) { // propagate deregistration
+                        // 如果nextUnarrived为0，且不是root，将其传播到上层
                         phase = parent.doArrive(ONE_DEREGISTER);
+                        // 修改state
                         UNSAFE.compareAndSwapLong(this, stateOffset,
                                                   s, s | EMPTY);
                     }
                     else
+                        // 向上层传播到达
                         phase = parent.doArrive(ONE_ARRIVAL);
                 }
                 return phase;
@@ -426,42 +462,55 @@ public class Phaser {
      */
     private int doRegister(int registrations) {
         // adjustment to state
+        // state应该加的值，注意这里是相当于同时增加parties和unarrived
         long adjust = ((long)registrations << PARTIES_SHIFT) | registrations;
         final Phaser parent = this.parent;
         int phase;
         for (;;) {
+            // todo-zh 待分析
             long s = (parent == null) ? state : reconcileState();
             int counts = (int)s;
             int parties = counts >>> PARTIES_SHIFT;
             int unarrived = counts & UNARRIVED_MASK;
+
+            // 检查是否溢出
             if (registrations > MAX_PARTIES - parties)
                 throw new IllegalStateException(badRegister(s));
             phase = (int)(s >>> PHASE_SHIFT);
             if (phase < 0)
                 break;
+            // 不是第一个参与者
             if (counts != EMPTY) {                  // not 1st registration
                 if (parent == null || reconcileState() == s) {
+                    // unarrived等于0说明当前阶段正在执行onAdvance()方法，等待其执行完毕
                     if (unarrived == 0)             // wait out advance
                         root.internalAwaitAdvance(phase, null);
+                    // 否则就修改state的值，增加adjust，如果成功就跳出循环
                     else if (UNSAFE.compareAndSwapLong(this, stateOffset,
                                                        s, s + adjust))
                         break;
                 }
             }
+            // 是第一个参与者
             else if (parent == null) {              // 1st root registration
+                // 计算state的值
                 long next = ((long)phase << PHASE_SHIFT) | adjust;
+                // 修改state的值，如果成功就跳出循环
                 if (UNSAFE.compareAndSwapLong(this, stateOffset, s, next))
                     break;
             }
             else {
+                // 多层级阶段的处理方式
                 synchronized (this) {               // 1st sub registration
                     if (state == s) {               // recheck under lock
+                        // 调用parent的注册
                         phase = parent.doRegister(1);
                         if (phase < 0)
                             break;
                         // finish registration whenever parent registration
                         // succeeded, even when racing with termination,
                         // since these are part of the same "transaction".
+                        // 自旋知道设置state成功
                         while (!UNSAFE.compareAndSwapLong
                                (this, stateOffset, s,
                                 ((long)phase << PHASE_SHIFT) | adjust)) {
@@ -676,33 +725,51 @@ public class Phaser {
         // Specialization of doArrive+awaitAdvance eliminating some reads/paths
         final Phaser root = this.root;
         for (;;) {
+            // state的值
             long s = (root == this) ? state : reconcileState();
+            // 当前阶段
             int phase = (int)(s >>> PHASE_SHIFT);
+            // 终止了
             if (phase < 0)
                 return phase;
+            // parties和unarrived的值
             int counts = (int)s;
+            // unarrived的值（state的低16位）
             int unarrived = (counts == EMPTY) ? 0 : (counts & UNARRIVED_MASK);
             if (unarrived <= 0)
                 throw new IllegalStateException(badArrive(s));
+            // 修改state的值，unarrived减1
             if (UNSAFE.compareAndSwapLong(this, stateOffset, s,
                                           s -= ONE_ARRIVAL)) {
+                // 如果不是最后一个到达的，则调用internalAwaitAdvance()方法自旋或进入队列等待
                 if (unarrived > 1)
                     return root.internalAwaitAdvance(phase, null);
+                // 到这里说明是最后一个到达的参与者
+                // 如果当前phaser不是root，等待parent的advance
                 if (root != this)
                     return parent.arriveAndAwaitAdvance();
+                // n只保留了state中parties的部分，也就是中16位
                 long n = s & PARTIES_MASK;  // base of next state
+                // parties的值，即下一次需要到达的参与者数量
                 int nextUnarrived = (int)n >>> PARTIES_SHIFT;
+                // 执行onAdvance()方法，返回true表示下一阶段参与者数量为0了，也就是结束了（设置terminate位）
                 if (onAdvance(phase, nextUnarrived))
                     n |= TERMINATION_BIT;
                 else if (nextUnarrived == 0)
+                    // 如果参与者为0，则设置为空
                     n |= EMPTY;
                 else
+                    // 否则设置unarrived
                     n |= nextUnarrived;
+                // phase加1
                 int nextPhase = (phase + 1) & MAX_PHASE;
                 n |= (long)nextPhase << PHASE_SHIFT;
+                // 修改state的值为n
                 if (!UNSAFE.compareAndSwapLong(this, stateOffset, s, n))
                     return (int)(state >>> PHASE_SHIFT); // terminated
+                // 唤醒其它参与者并进入下一个阶段
                 releaseWaiters(phase);
+                // 返回下一阶段
                 return nextPhase;
             }
         }
@@ -990,7 +1057,7 @@ public class Phaser {
      * interrupt. Currently, nodes are removed only if they are at
      * head of queue, which suffices to reduce memory footprint in
      * most usages.
-     *
+     * releaseWaiters的加强版，移除任何超时或者被中断的节点，只移除队首节点
      * @return current phase on exit
      */
     private int abortWait(int phase) {
@@ -999,8 +1066,10 @@ public class Phaser {
             Thread t;
             QNode q = head.get();
             int p = (int)(root.state >>> PHASE_SHIFT);
+            // 节点未释放并且phase没变化，就返回
             if (q == null || ((t = q.thread) != null && q.phase == p))
                 return p;
+            // 释放头节点，并唤醒线程
             if (head.compareAndSet(q, q.next) && t != null) {
                 q.thread = null;
                 LockSupport.unpark(t);
@@ -1027,7 +1096,10 @@ public class Phaser {
     /**
      * Possibly blocks and waits for phase to advance unless aborted.
      * Call only on root phaser.
-     *
+     * 等待onAdvance()方法执行完毕
+     * 原理是先自旋一定次数，如果进入下一个阶段，这个方法直接就返回了，
+     * 如果自旋一定次数后还没有进入下一个阶段，则当前线程入队列，等待onAdvance()执行完毕唤醒
+     9
      * @param phase current phase
      * @param node if non-null, the wait node to track interrupt and timeout;
      * if null, denotes noninterruptible wait
@@ -1035,35 +1107,45 @@ public class Phaser {
      */
     private int internalAwaitAdvance(int phase, QNode node) {
         // assert root == this;
+        // 保证队列为空，释放上一phase的等待者（唤醒队列中等待者）
         releaseWaiters(phase-1);          // ensure old queue clean
         boolean queued = false;           // true when node is enqueued
         int lastUnarrived = 0;            // to increase spins upon change
         int spins = SPINS_PER_ARRIVAL;
         long s;
         int p;
+        // 检查当前阶段是否变化，如果变化了说明进入下一个阶段了，这时候就没有必要自旋了
         while ((p = (int)((s = state) >>> PHASE_SHIFT)) == phase) {
             if (node == null) {           // spinning in noninterruptible mode
+                // 未完成的参与者数量
                 int unarrived = (int)s & UNARRIVED_MASK;
+                // todo-zh unarrived有变化，如果未到达的数量小于cpu核心（这样可以同时到达），按倍数增加自旋次数
                 if (unarrived != lastUnarrived &&
                     (lastUnarrived = unarrived) < NCPU)
                     spins += SPINS_PER_ARRIVAL;
                 boolean interrupted = Thread.interrupted();
+                // 被中断了或者自旋完了，创建节点
                 if (interrupted || --spins < 0) { // need node to record intr
                     node = new QNode(this, phase, false, false, 0L);
+                    // 如果中断了，设置节点中断了（如果节点可中断，那么后面会清除掉）
                     node.wasInterrupted = interrupted;
                 }
             }
             else if (node.isReleasable()) // done or aborted
+                // todo-zh 节点被释放，就从这里退出循环
                 break;
             else if (!queued) {           // push onto queue
+                // 节点入队列
                 AtomicReference<QNode> head = (phase & 1) == 0 ? evenQ : oddQ;
                 QNode q = node.next = head.get();
+                // 等待队列的phase等于当前phase（即等待第一个节点将phase修改完），将节点添加的头部
                 if ((q == null || q.phase == phase) &&
                     (int)(state >>> PHASE_SHIFT) == phase) // avoid stale enq
                     queued = head.compareAndSet(q, node);
             }
             else {
                 try {
+                    // 当前线程进入阻塞状态，跟调用LockSupport.park()一样，等待被唤醒
                     ForkJoinPool.managedBlock(node);
                 } catch (InterruptedException ie) {
                     node.wasInterrupted = true;
@@ -1071,14 +1153,19 @@ public class Phaser {
             }
         }
 
+        // 到这里说明节点所在线程已经被唤醒了
         if (node != null) {
+            // 清除thread，这样就不会调用unpark
             if (node.thread != null)
                 node.thread = null;       // avoid need for unpark()
+            // 重设置中断位
             if (node.wasInterrupted && !node.interruptible)
                 Thread.currentThread().interrupt();
+            // phase未发生变化
             if (p == phase && (p = (int)(state >>> PHASE_SHIFT)) == phase)
                 return abortWait(phase); // possibly clean up on abort
         }
+        // 唤醒当前阶段阻塞着的线程
         releaseWaiters(phase);
         return p;
     }
@@ -1109,18 +1196,22 @@ public class Phaser {
         }
 
         public boolean isReleasable() {
+            // thread为空，说明该节点释放了
             if (thread == null)
                 return true;
+            // 阶段和phaser不一致，释放节点
             if (phaser.getPhase() != phase) {
                 thread = null;
                 return true;
             }
+            // 中断了，释放节点
             if (Thread.interrupted())
                 wasInterrupted = true;
             if (wasInterrupted && interruptible) {
                 thread = null;
                 return true;
             }
+            // 超时了，释放节点
             if (timed) {
                 if (nanos > 0L) {
                     nanos = deadline - System.nanoTime();
@@ -1134,12 +1225,15 @@ public class Phaser {
         }
 
         public boolean block() {
+            // 如果节点是否了，就返回
             if (isReleasable())
                 return true;
+            // 挂起线程
             else if (!timed)
                 LockSupport.park(this);
             else if (nanos > 0L)
                 LockSupport.parkNanos(this, nanos);
+            // 返回节点是否释放了
             return isReleasable();
         }
     }

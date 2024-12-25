@@ -167,6 +167,7 @@ public class Semaphore implements java.io.Serializable {
         private static final long serialVersionUID = 1192457210091910933L;
 
         Sync(int permits) {
+            // 设置令牌数
             setState(permits);
         }
 
@@ -176,8 +177,10 @@ public class Semaphore implements java.io.Serializable {
 
         final int nonfairTryAcquireShared(int acquires) {
             for (;;) {
+                // 不判断是否有线程在阻塞队列，直接抢令牌
                 int available = getState();
                 int remaining = available - acquires;
+                // 如果令牌不够，或者抢令牌成功，直接返回；否则自旋继续抢令牌（线程竞争，cas失败）
                 if (remaining < 0 ||
                     compareAndSetState(available, remaining))
                     return remaining;
@@ -186,6 +189,7 @@ public class Semaphore implements java.io.Serializable {
 
         protected final boolean tryReleaseShared(int releases) {
             for (;;) {
+                // 释放资源，由于多线程竞争，需要cas
                 int current = getState();
                 int next = current + releases;
                 if (next < current) // overflow
@@ -242,10 +246,12 @@ public class Semaphore implements java.io.Serializable {
 
         protected int tryAcquireShared(int acquires) {
             for (;;) {
+                // 优先判断是否有线程阻塞
                 if (hasQueuedPredecessors())
                     return -1;
                 int available = getState();
                 int remaining = available - acquires;
+                // 减少state
                 if (remaining < 0 ||
                     compareAndSetState(available, remaining))
                     return remaining;
@@ -423,6 +429,7 @@ public class Semaphore implements java.io.Serializable {
      * in the application.
      */
     public void release() {
+        // 释放资源
         sync.releaseShared(1);
     }
 

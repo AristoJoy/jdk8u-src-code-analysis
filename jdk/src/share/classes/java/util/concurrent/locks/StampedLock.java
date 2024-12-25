@@ -185,6 +185,18 @@ import java.util.concurrent.locks.LockSupport;
  *   }
  * }}</pre>
  *
+ *  StampedLock具有三种模式：写模式、读模式、乐观读模式。
+ *  乐观读，它是指当乐观读时假定没有其它线程修改数据，读取完成后再检查下版本号有没有变化，没有变化就读取成功了，这种模式更适用于读多写少的场景。
+ *
+ *  问题
+ * （1）StampedLock是什么？
+ *
+ * （2）StampedLock具有什么特性？
+ *
+ * （3）StampedLock是否支持可重入？
+ *
+ * （4）StampedLock与ReentrantReadWriteLock的对比？
+ * 读锁（悲观）的使用方式可以进行升级，通过tryConvertToWriteLock()方式可以升级为写锁
  * @since 1.8
  * @author Doug Lea
  */
@@ -284,27 +296,45 @@ public class StampedLock implements java.io.Serializable {
     private static final int OVERFLOW_YIELD_RATE = 7; // must be power 2 - 1
 
     /** The number of bits to use for reader count before overflowing */
+    // 一堆常量
+
+    // 读线程的个数占有低7位
     private static final int LG_READERS = 7;
 
     // Values for lock state and stamp operations
+    // 读线程个数每次增加的单位
     private static final long RUNIT = 1L;
+
+    // 写线程个数所在的位置 128 = 1000 0000
     private static final long WBIT  = 1L << LG_READERS;
+
+    // 读线程个数所在的位置掩码 127 = 1111 111
     private static final long RBITS = WBIT - 1L;
+
+    // 最大读线程个数 126
     private static final long RFULL = RBITS - 1L;
+
+    // 读线程个数和写线程个数的掩码 255 = 1111 1111
     private static final long ABITS = RBITS | WBIT;
+
+    // 读线程个数的反数，高25位全部为1 -128
     private static final long SBITS = ~RBITS; // note overlap with ABITS
 
     // Initial value for lock state; avoid failure value zero
+    // state的初始值 256
     private static final long ORIGIN = WBIT << 1;
 
     // Special value from cancelled acquire methods so caller can throw IE
+    // 中断
     private static final long INTERRUPTED = 1L;
 
     // Values for node status; order matters
+    // 节点状态
     private static final int WAITING   = -1;
     private static final int CANCELLED =  1;
 
     // Modes for nodes (int not boolean to allow arithmetic)
+    // 节点模式
     private static final int RMODE = 0;
     private static final int WMODE = 1;
 
@@ -312,9 +342,11 @@ public class StampedLock implements java.io.Serializable {
     static final class WNode {
         volatile WNode prev;
         volatile WNode next;
+        // 读线程所用的链表（实际是一个栈结果）
         volatile WNode cowait;    // list of linked readers
         volatile Thread thread;   // non-null while possibly parked
         volatile int status;      // 0, WAITING, or CANCELLED
+        // 读模式还是写模式
         final int mode;           // RMODE or WMODE
         WNode(int m, WNode p) { mode = m; prev = p; }
     }
@@ -330,14 +362,17 @@ public class StampedLock implements java.io.Serializable {
     transient ReadWriteLockView readWriteLockView;
 
     /** Lock sequence/state */
+    // 存储着当前的版本号，类似于AQS的状态变量state
     private transient volatile long state;
     /** extra reader count when state read count saturated */
+    // 当读线程count超过位数时，额外的计数器
     private transient int readerOverflow;
 
     /**
      * Creates a new lock, initially in unlocked state.
      */
     public StampedLock() {
+        // 初始版本号
         state = ORIGIN;
     }
 
@@ -349,6 +384,10 @@ public class StampedLock implements java.io.Serializable {
      */
     public long writeLock() {
         long s, next;  // bypass acquireWrite in fully unlocked case only
+        // ABITS = 255 = 1111 1111
+        // WBITS = 128 = 1000 0000
+        // state与ABITS如果等于0，尝试原子更新state的值加WBITS
+        // 如果成功则返回更新的值，如果失败调用acquireWrite()方法
         return ((((s = state) & ABITS) == 0L &&
                  U.compareAndSwapLong(this, STATE, s, next = s + WBIT)) ?
                 next : acquireWrite(false, 0L));
@@ -423,6 +462,9 @@ public class StampedLock implements java.io.Serializable {
      */
     public long readLock() {
         long s = state, next;  // bypass acquireRead on common uncontended case
+        // 没有写锁占用，并且读锁被获取的次数未达到最大值
+        // 尝试原子更新读锁被获取的次数加1
+        // 如果成功直接返回，如果失败调用acquireRead()方法
         return ((whead == wtail && (s & ABITS) < RFULL &&
                  U.compareAndSwapLong(this, STATE, s, next = s + RUNIT)) ?
                 next : acquireRead(false, 0L));
@@ -537,12 +579,23 @@ public class StampedLock implements java.io.Serializable {
      * @param stamp a stamp returned by a write-lock operation
      * @throws IllegalMonitorStateException if the stamp does
      * not match the current state of this lock
+     * （1）更改state的值，释放写锁；
+     * （2）版本号加1；
+     * （3）唤醒下一个等待着的节点；
      */
     public void unlockWrite(long stamp) {
         WNode h;
+        // 检查版本号对不对或者没有写锁
         if (state != stamp || (stamp & WBIT) == 0L)
             throw new IllegalMonitorStateException();
+
+        // 这行代码实际有两个作用：
+        // 1. 更新版本号加1
+        // 2. 释放写锁
+        // stamp + WBIT实际会把state的第8位置为0，也就相当于释放了写锁
+        // 同时会进1，也就是高24位整体加1了
         state = (stamp += WBIT) == 0L ? ORIGIN : stamp;
+        // 如果头节点不为空，并且状态不为0，调用release方法唤醒它的下一个节点
         if ((h = whead) != null && h.status != 0)
             release(h);
     }
@@ -1013,12 +1066,16 @@ public class StampedLock implements java.io.Serializable {
     private void release(WNode h) {
         if (h != null) {
             WNode q; Thread w;
+            // 将其状态改为0
             U.compareAndSwapInt(h, WSTATUS, WAITING, 0);
+            // 如果头节点的下一个节点为空或者其状态为已取消
             if ((q = h.next) == null || q.status == CANCELLED) {
+                // 从尾节点向前遍历找到一个可用的节点（状态为WAITING）
                 for (WNode t = wtail; t != null && t != h; t = t.prev)
                     if (t.status <= 0)
                         q = t;
             }
+            // 唤醒q节点所在的线程
             if (q != null && (w = q.thread) != null)
                 U.unpark(w);
         }
@@ -1032,74 +1089,126 @@ public class StampedLock implements java.io.Serializable {
      * @param deadline if nonzero, the System.nanoTime value to timeout
      * at (and return zero)
      * @return next state, or INTERRUPTED
+     * 第一段自旋——入队：
+     * （1）如果头节点等于尾节点，说明没有其它线程排队，那就多自旋一会，看能不能尝试获取到写锁；
+     * （2）否则，自旋次数为0，直接让其入队；
+     * 第二段自旋——阻塞并等待被唤醒 + 第三段自旋——不断尝试获取写锁：
+     * （1）第三段自旋在第二段自旋内部；
+     * （2）如果头节点等于前置节点，那就进入第三段自旋，不断尝试获取写锁；
+     * （3）否则，尝试唤醒头节点中等待着的读线程；
+     * （4）最后，如果当前线程一直都没有获取到写锁，就阻塞当前线程并等待被唤醒；
      */
     private long acquireWrite(boolean interruptible, long deadline) {
+        // node为新增节点，p为尾节点（即将成为node的前置节点）
         WNode node = null, p;
+
+        // 第一次自旋——入队
         for (int spins = -1;;) { // spin while enqueuing
+            // m记录高25位，s为state，ns为下一个state
             long m, s, ns;
+            // 尝试获取写锁
             if ((m = (s = state) & ABITS) == 0L) {
                 if (U.compareAndSwapLong(this, STATE, s, ns = s + WBIT))
                     return ns;
             }
             else if (spins < 0)
+                // 如果自旋次数小于0，计算自旋的次数
+                // (m == WBIT && wtail == whead)，
+                //  即写锁独占且队列为空，则快轮到自己了，自旋即可，如果自旋完了还没有轮到自己，则入队列，自旋次数为SPINS；
+                //  否则为0，直接入队列
                 spins = (m == WBIT && wtail == whead) ? SPINS : 0;
             else if (spins > 0) {
+                // 当自旋次数大于0时，当前这次自旋随机减一次自旋次数，即可能减自旋次数或不减
                 if (LockSupport.nextSecondarySeed() >= 0)
                     --spins;
             }
             else if ((p = wtail) == null) { // initialize queue
+                // 如果队列未初始化，新建一个空节点并初始化头节点和尾节点
                 WNode hd = new WNode(WMODE, null);
                 if (U.compareAndSwapObject(this, WHEAD, null, hd))
                     wtail = hd;
             }
             else if (node == null)
+                // 如果新增节点还未初始化，则新建之，并赋值其前置节点为尾节点
                 node = new WNode(WMODE, p);
             else if (node.prev != p)
+                // 如果尾节点有变化，则更新新增节点的前置节点为新的尾节点
                 node.prev = p;
             else if (U.compareAndSwapObject(this, WTAIL, p, node)) {
+                // 尝试更新新增节点为新的尾节点成功，则退出循环
                 p.next = node;
                 break;
             }
         }
 
+        // 第二次自旋——阻塞并等待唤醒
         for (int spins = -1;;) {
+            // h为头节点，np为新增节点的前置节点，pp为前前置节点，ps为前置节点的状态
             WNode h, np, pp; int ps;
+
+            // 如果头节点等于前置节点，说明快轮到自己了
             if ((h = whead) == p) {
                 if (spins < 0)
+                    // 初始化自旋次数
                     spins = HEAD_SPINS;
                 else if (spins < MAX_HEAD_SPINS)
+                    // 增加自旋次数
                     spins <<= 1;
+                // 第三次自旋，不断尝试获取写锁
                 for (int k = spins;;) { // spin at head
                     long s, ns;
                     if (((s = state) & ABITS) == 0L) {
                         if (U.compareAndSwapLong(this, STATE, s,
                                                  ns = s + WBIT)) {
+                            // 尝试获取写锁成功，将node设置为新头节点并清除其前置节点(gc)
                             whead = node;
                             node.prev = null;
                             return ns;
                         }
                     }
+                    // 随机立减自旋次数，当自旋次数减为0时跳出循环再重试
                     else if (LockSupport.nextSecondarySeed() >= 0 &&
                              --k <= 0)
                         break;
                 }
             }
             else if (h != null) { // help release stale waiters
+                // 这段代码很难进来，是用于协助唤醒读节点的
+                // 我是这么调试进来的：
+                // 起三个写线程，两个读线程
+                // 写线程1获取锁不要释放
+                // 读线程1获取锁，读线程2获取锁（会阻塞）
+                // 写线程2获取锁（会阻塞）
+                // 写线程1释放锁，此时会唤醒读线程1
+                // 在读线程1里面先不要唤醒读线程2
+                // 写线程3获取锁，此时就会走到这里来了
+
+                // w1 hold lock
+                // r1 -> r2 -> w2
+                // w2 release lock
+                // r1 wakeup
+                // r2 -> w2
+                // w3 acquire lock   p = w2 ; h = r2
                 WNode c; Thread w;
+                // 如果head的cowait不为空，则唤醒里面所有节点
                 while ((c = h.cowait) != null) {
                     if (U.compareAndSwapObject(h, WCOWAIT, c, c.cowait) &&
                         (w = c.thread) != null)
                         U.unpark(w);
                 }
             }
+            // 如果头节点没有变化
             if (whead == h) {
+                // 如果尾节点有变化，则更新
                 if ((np = node.prev) != p) {
                     if (np != null)
                         (p = np).next = node;   // stale
                 }
                 else if ((ps = p.status) == 0)
+                    // 如果尾节点状态为0，则更新成WAITING
                     U.compareAndSwapInt(p, WSTATUS, 0, WAITING);
                 else if (ps == CANCELLED) {
+                    // 如果尾节点状态为取消，则把它从链表中删除
                     if ((pp = p.prev) != null) {
                         node.prev = pp;
                         pp.next = node;
@@ -1107,18 +1216,24 @@ public class StampedLock implements java.io.Serializable {
                 }
                 else {
                     long time; // 0 argument to park means no timeout
+                    // 有超时时间的处理
                     if (deadline == 0L)
                         time = 0L;
                     else if ((time = deadline - System.nanoTime()) <= 0L)
+                        // 已超时，剔除当前节点
                         return cancelWaiter(node, node, false);
                     Thread wt = Thread.currentThread();
                     U.putObject(wt, PARKBLOCKER, this);
+                    // 把node的线程指向当前线程
                     node.thread = wt;
+                    // 如果
                     if (p.status < 0 && (p != h || (state & ABITS) != 0L) &&
                         whead == h && node.prev == p)
+                        // 阻塞当前线程
                         U.park(false, time);  // emulate LockSupport.park
                     node.thread = null;
                     U.putObject(wt, PARKBLOCKER, null);
+                    // 如果中断了，取消当前节点
                     if (interruptible && Thread.interrupted())
                         return cancelWaiter(node, node, true);
                 }
@@ -1136,39 +1251,64 @@ public class StampedLock implements java.io.Serializable {
      * @return next state, or INTERRUPTED
      */
     private long acquireRead(boolean interruptible, long deadline) {
+
+        // node为新增节点，p为尾节点
         WNode node = null, p;
+        // 第一段自旋 -- 入队
         for (int spins = -1;;) {
+            // 头节点
             WNode h;
+
+            // 如果头节点等于尾节点
+            // 说明没有排队的线程了，快轮到自己了，直接自旋不断尝试获取读锁
             if ((h = whead) == (p = wtail)) {
+
+                // 第二段自旋 -- 不断尝试获取读锁
                 for (long m, s, ns;;) {
+
+                    // 尝试获取读锁，如果成功了直接返回版本号
                     if ((m = (s = state) & ABITS) < RFULL ?
                         U.compareAndSwapLong(this, STATE, s, ns = s + RUNIT) :
                         (m < WBIT && (ns = tryIncReaderOverflow(s)) != 0L))
+                        // 如果读线程个数达到了最大值，会溢出，返回的是0
                         return ns;
                     else if (m >= WBIT) {
+                        // 其它线程先一步获取了写锁
                         if (spins > 0) {
+
+                            // 随机立减自旋次数
                             if (LockSupport.nextSecondarySeed() >= 0)
                                 --spins;
                         }
                         else {
+                            // 如果自旋次数为0了，看看是否要跳出循环
                             if (spins == 0) {
                                 WNode nh = whead, np = wtail;
+                                // 头尾节点未变化，或者队列非空，就退出第二次自旋
                                 if ((nh == h && np == p) || (h = nh) != (p = np))
                                     break;
                             }
+                            // 设置自旋次数
                             spins = SPINS;
                         }
                     }
                 }
             }
+
+            // 如果尾节点为空，初始化头节点和尾节点
             if (p == null) { // initialize queue
                 WNode hd = new WNode(WMODE, null);
                 if (U.compareAndSwapObject(this, WHEAD, null, hd))
                     wtail = hd;
             }
             else if (node == null)
+                // 如果新增节点为空，初始化之
                 node = new WNode(RMODE, p);
             else if (h == p || p.mode != RMODE) {
+                // 如果头节点等于尾节点或者尾节点不是读模式
+                // 当前节点入队
+
+                // 更新尾节点发生变化，更新node前驱为新的尾节点
                 if (node.prev != p)
                     node.prev = p;
                 else if (U.compareAndSwapObject(this, WTAIL, p, node)) {
@@ -1178,43 +1318,68 @@ public class StampedLock implements java.io.Serializable {
             }
             else if (!U.compareAndSwapObject(p, WCOWAIT,
                                              node.cowait = p.cowait, node))
+                // 接着上一个elseif，这里肯定是尾节点为读模式了
+                // 将当前节点加入到尾节点的cowait中，这是一个栈
+                // 上面的CAS成功了是不会进入到这里来的
                 node.cowait = null;
             else {
+                // 第三段自旋——阻塞当前线程并等待被唤醒
                 for (;;) {
                     WNode pp, c; Thread w;
+                    // 如果头节点不为空且其cowait不为空，协助唤醒其中等待的读线程
                     if ((h = whead) != null && (c = h.cowait) != null &&
                         U.compareAndSwapObject(h, WCOWAIT, c, c.cowait) &&
                         (w = c.thread) != null) // help release
                         U.unpark(w);
+
+                    // 如果头节点等于前前置节点或者等于前置节点或者前前置节点为空
+                    // 这同样说明快轮到自己了
                     if (h == (pp = p.prev) || h == p || pp == null) {
                         long m, s, ns;
                         do {
+                            // 第四段自旋——又是不断尝试获取锁
                             if ((m = (s = state) & ABITS) < RFULL ?
                                 U.compareAndSwapLong(this, STATE, s,
                                                      ns = s + RUNIT) :
                                 (m < WBIT &&
                                  (ns = tryIncReaderOverflow(s)) != 0L))
                                 return ns;
+
+                            // todo-zh 只有当前时刻没有其它线程占有写锁就不断尝试
                         } while (m < WBIT);
                     }
+
+                    // 如果头节点未曾改变且前前置节点也未曾改
+                    // 阻塞当前线程
                     if (whead == h && p.prev == pp) {
                         long time;
+
+                        // 如果前前置节点为空，或者头节点等于前置节点，或者前置节点已取消
+                        // 从第一个for自旋开始重试
                         if (pp == null || h == p || p.status > 0) {
                             node = null; // throw away
                             break;
                         }
+                        // 超时检查
                         if (deadline == 0L)
                             time = 0L;
                         else if ((time = deadline - System.nanoTime()) <= 0L)
+                            // 如果超时了，取消当前节点
                             return cancelWaiter(node, p, false);
                         Thread wt = Thread.currentThread();
                         U.putObject(wt, PARKBLOCKER, this);
                         node.thread = wt;
+
+                        // 检测之前的条件未曾改变
                         if ((h != pp || (state & ABITS) == WBIT) &&
                             whead == h && p.prev == pp)
+                            // 阻塞当前线程并等待被唤醒
                             U.park(false, time);
+
+                        // 唤醒之后清除线程
                         node.thread = null;
                         U.putObject(wt, PARKBLOCKER, null);
+                        // 如果中断了，取消当前节点
                         if (interruptible && Thread.interrupted())
                             return cancelWaiter(node, p, true);
                     }
@@ -1222,6 +1387,8 @@ public class StampedLock implements java.io.Serializable {
             }
         }
 
+        // 只有第一个读线程会走到下面的for循环处，参考上面第一段自旋中有一个break，当第一个读线程入队的时候break出来的
+        // 第五段自旋——跟上面的逻辑差不多，只不过这里单独搞一个自旋针对第一个读线程
         for (int spins = -1;;) {
             WNode h, np, pp; int ps;
             if ((h = whead) == p) {

@@ -394,11 +394,18 @@ public class ReentrantReadWriteLock
             int w = exclusiveCount(c);
             if (c != 0) {
                 // (Note: if c != 0 and w == 0 then shared count != 0)
+                // 看下这里返回 false 的情况：
+                //   c != 0 && w == 0: 写锁可用，但是有线程持有读锁(也可能是自己持有)
+                //   c != 0 && w !=0 && current != getExclusiveOwnerThread(): 其他线程持有写锁
+                //   也就是说，只要有读锁或写锁被占用，这次就不能获取到写锁
+                // todo-zh 即持有读锁，不能申请写锁，即锁升级，否则会发生死锁；
+                //  如果持有读锁的线程获取写锁，到这里会返回false，那么就进阻塞队列了。自己把自己弄休眠了，可能后序没有线程去唤醒（例如后面的都是写锁的话）就形成了死锁。
                 if (w == 0 || current != getExclusiveOwnerThread())
                     return false;
                 if (w + exclusiveCount(acquires) > MAX_COUNT)
                     throw new Error("Maximum lock count exceeded");
                 // Reentrant acquire
+                // 这里不需要 CAS，仔细看就知道了，能到这里的，只可能是写锁重入，不然在上面的 if 就拦截了
                 setState(c + acquires);
                 return true;
             }
@@ -436,6 +443,11 @@ public class ReentrantReadWriteLock
                     // Releasing the read lock has no effect on readers,
                     // but it may allow waiting writers to proceed if
                     // both read and write locks are now free.
+                    // 如果 nextc == 0，那就是 state 全部 32 位都为 0，也就是读锁和写锁都空了
+                    // 此时这里返回 true 的话，其实是帮助唤醒后继节点中的获取写锁的线程
+                    // todo-zh 因为如果一个线程获取了读锁，后面连续的获取读锁的线程，是不会进阻塞队列的，因为读锁是共享的，可以被多个线程公有.
+                    //  只有后面是写锁才会进队列，所以当读锁完全释放时，阻塞队列第一个节点一定是写锁线程。
+                    //  由于共享锁传播是遇到第一个独占锁就终止了，而此时阻塞队列第一个就是写锁线程，所以唤醒的一定是获取写锁的线程。
                     return nextc == 0;
             }
         }
@@ -467,6 +479,13 @@ public class ReentrantReadWriteLock
                 getExclusiveOwnerThread() != current)
                 return -1;
             int r = sharedCount(c);
+            // readerShouldBlock() 返回 true，2 种情况：
+            //  1. 在 FairSync 中说的是 hasQueuedPredecessors()，即阻塞队列中有其他元素在等待锁。
+            //      也就是说，公平模式下，有人在排队呢，你新来的不能直接获取锁
+            //  2. 在 NonFairSync 中说的是 apparentlyFirstQueuedIsExclusive()，即判断阻塞队列中 head 的第一个后继节点是否是来获取写锁的，如果是的话，让这个写锁先来，避免写锁饥饿。
+            //
+            //  作者给写锁定义了更高的优先级，所以如果碰上获取写锁的线程马上就要获取到锁了，获取读锁的线程不应该和它抢。
+            //  如果 head.next 不是来获取写锁的，那么可以随便抢，因为是非公平模式，大家比比 CAS 速度
             if (!readerShouldBlock() &&
                 r < MAX_COUNT &&
                 compareAndSetState(c, c + SHARED_UNIT)) {
@@ -491,6 +510,11 @@ public class ReentrantReadWriteLock
         /**
          * Full version of acquire for reads, that handles CAS misses
          * and reentrant reads not dealt with in tryAcquireShared.
+         * 1. 刚刚我们说了可能是因为 CAS 失败，如果就此返回，那么就要进入到阻塞队列了，
+         *    想想有点不甘心，因为都已经满足了 !readerShouldBlock()，也就是说本来可以不用到阻塞队列的，
+         *    所以进到这个方法其实是增加 CAS 成功的机会
+         * 2. 在 NonFairSync 情况下，虽然 head.next 是获取写锁的，我知道它等待很久了，我没想和它抢，
+         *    可是如果我是来重入读锁的，那么只能表示对不起了
          */
         final int fullTryAcquireShared(Thread current) {
             /*

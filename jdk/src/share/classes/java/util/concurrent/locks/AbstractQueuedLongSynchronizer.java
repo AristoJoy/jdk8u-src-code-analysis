@@ -593,6 +593,8 @@ public abstract class AbstractQueuedLongSynchronizer
              * need a signal, but don't park yet.  Caller will need to
              * retry to make sure it cannot acquire before parking.
              */
+            // 这里不直接返回true，如果是第三个节点，假如在CAS设置的时候，第二个节点获取了锁，并且执行完了
+            // 这里不返回true，就可以尝试去获取锁，而不用park后等待唤醒
             compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
         }
         return false;

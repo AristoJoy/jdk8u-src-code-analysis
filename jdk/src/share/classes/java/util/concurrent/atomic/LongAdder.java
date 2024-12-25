@@ -78,16 +78,38 @@ public class LongAdder extends Striped64 implements Serializable {
 
     /**
      * Adds the given value.
-     *
+     * （1）最初无竞争时只更新base；
+     * （2）直到更新base失败时，创建cells数组；
+     * （3）当多个线程竞争同一个Cell比较激烈时，可能要扩容；
      * @param x the value to add
      */
     public void add(long x) {
+        // as是Striped64中的cells属性
+        // b是Striped64中的base属性
+        // v是当前线程hash到的Cell中存储的值
+        // m是cells的长度减1，hash时作为掩码使用
+        // a是当前线程hash到的Cell
         Cell[] as; long b, v; int m; Cell a;
+
+        // 条件1：cells不为空，说明出现过竞争，cells已经创建
+        // 条件2：cas操作base失败，说明其它线程先一步修改了base，正在出现竞争
         if ((as = cells) != null || !casBase(b = base, b + x)) {
+
+            // true表示当前竞争还不激烈
+            // false表示竞争激烈，多个线程hash到同一个Cell，可能要扩容
             boolean uncontended = true;
+
+            // 条件1：cells为空，说明正在出现竞争，上面是从条件2过来的
+            // 条件2：应该不会出现
+            // 条件3：当前线程所在的Cell为空，说明当前线程还没有更新过Cell，应初始化一个Cell
+            // 条件4：更新当前线程所在的Cell失败，说明现在竞争很激烈，多个线程hash到了同一个Cell，应扩容
             if (as == null || (m = as.length - 1) < 0 ||
                 (a = as[getProbe() & m]) == null ||
                 !(uncontended = a.cas(v = a.value, v + x)))
+
+                // getProbe()方法返回的是线程中的threadLocalRandomProbe字段
+                // 它是通过随机数生成的一个值，对于一个确定的线程这个值是固定的
+                // 除非刻意修改它
                 longAccumulate(x, null, uncontended);
         }
     }
@@ -112,12 +134,17 @@ public class LongAdder extends Striped64 implements Serializable {
      * updates returns an accurate result, but concurrent updates that
      * occur while the sum is being calculated might not be
      * incorporated.
+     * 如果前面已经累加到sum上的Cell的value有修改，计算结果是不精确的。
+     * todo-zh 所以LongAdder可以说不是强一致性的，它是最终一致性的
      *
      * @return the sum
      */
     public long sum() {
         Cell[] as = cells; Cell a;
+        // sum初始等于base
         long sum = base;
+
+        // 如果cells不为空,累加所有的值到sum上
         if (as != null) {
             for (int i = 0; i < as.length; ++i) {
                 if ((a = as[i]) != null)
